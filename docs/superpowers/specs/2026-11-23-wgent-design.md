@@ -46,7 +46,7 @@ Por qué: que un agente pueda **encender/apagar un túnel sin que el humano inte
 
 | Enfoque | Resultado |
 |---|---|
-| **Go + servicio de Windows propio + named pipe** | **Elegido.** WireGuard para Windows está en Go: se pueden usar sus paquetes (`golang.zx2c4.com/wireguard/windows`) para leer estadísticas reales del adaptador. Binario único. |
+| **Go + servicio de Windows propio + named pipe** | **Elegido.** Binario único, `x/sys/windows/svc` maduro para servicios, `go-winio` para named pipes con ACL. (Revisión: las estadísticas salen de `wg.exe dump`, ver Operaciones.) |
 | Rust + servicio propio | Descartado: sin bindings oficiales; habría que parsear la salida de `wg.exe`. |
 | C# .NET 10 | Descartado: binario pesado, Native AOT con WinForms problemático, mismo parseo de `wg.exe`. |
 | Mantener tareas programadas | Descartado: una tarea no recibe argumentos, no escala a N túneles. |
@@ -68,7 +68,7 @@ Un solo ejecutable `wgent.exe` con dos roles:
 - `list`: lee el directorio de configuraciones (`*.conf.dpapi`, `*.conf`) → nombres + si están activos.
 - `up`: si ya existe el servicio `WireGuardTunnel$<n>` y está parado, lo inicia; si no existe, ejecuta `wireguard.exe /installtunnelservice <ruta>` (CLI estable y documentada de WireGuard). Espera hasta que el servicio esté `Running` o venza un timeout (15 s).
 - `down`: `wireguard.exe /uninstalltunnelservice <n>`; espera a que el servicio desaparezca.
-- `status`: estado del servicio del túnel + estadísticas del adaptador vía el paquete del driver de WireGuard (último handshake por peer, rx/tx).
+- `status`: estado del servicio del túnel + estadísticas vía `wg.exe show <n> dump` (formato tabulado para máquinas: último handshake por peer, rx/tx). Revisión 2026-11-23: se descartó el paquete `driver` de wireguard-windows porque requiere `wireguard.dll`, que la instalación oficial no deja en System32 (va embebido en `wireguard.exe`).
 
 ### Veredicto de estado
 
@@ -150,7 +150,7 @@ Si no existe, se usa sin default. `wgent config set-default` la crea.
 ## Distribución
 
 - `go install github.com/marr-cloud/wgent/cmd/wgent@latest` o binario de GitHub Releases (goreleaser, windows/amd64 y arm64).
-- `wgent service install` copia nada: registra el servicio apuntando a la ruta actual del ejecutable. README advierte que hay que reinstalar si se mueve.
+- `wgent service install` copia el ejecutable a `%ProgramFiles%\wgent\wgent.exe` y registra el servicio apuntando ahí (un servicio SYSTEM no debe ejecutarse desde una ruta escribible por el usuario). Cliente y servicio intercambian `protocol_version`; si no coinciden, el cliente sugiere `sudo wgent service install` para actualizar.
 
 ## Tests
 
