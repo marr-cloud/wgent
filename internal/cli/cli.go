@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"runtime/debug"
 	"strings"
 
 	"github.com/marr-cloud/wgent/internal/api"
@@ -178,9 +179,12 @@ func (a *app) resolve(arg string) (string, error) {
 }
 
 func (a *app) list() int {
+	// list does not need the default tunnel: a broken config only loses the
+	// default marker.
 	c, err := config.Load(a.d.ConfigPath)
 	if err != nil {
-		return a.fail(err)
+		fmt.Fprintf(a.d.Stderr, "warning: %v (no default tunnel marked)\n", err)
+		c = config.Config{}
 	}
 	resp, err := a.d.Client.Do(api.Request{Op: api.OpList})
 	if err != nil {
@@ -359,4 +363,16 @@ func (a *app) serviceCmd(rest []string) int {
 		return 0
 	}
 	return a.usage(fmt.Sprintf("unknown service command %q", rest[0]))
+}
+
+// ResolveVersion returns v unless it is the "dev" default, in which case it
+// falls back to the module version recorded by `go install module@version`.
+func ResolveVersion(v string, info func() (*debug.BuildInfo, bool)) string {
+	if v != "dev" {
+		return v
+	}
+	if bi, ok := info(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return v
 }

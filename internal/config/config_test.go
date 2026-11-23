@@ -63,14 +63,14 @@ func TestLoadMalformed(t *testing.T) {
 
 func TestLoadValues(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(p, []byte("default_tunnel = \"a-ado-cloud\"\n[tray]\npoll_seconds = 5\n"), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte("default_tunnel = \"work\"\n[tray]\npoll_seconds = 5\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c, err := Load(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.DefaultTunnel != "a-ado-cloud" || c.Tray.PollSeconds != 5 {
+	if c.DefaultTunnel != "work" || c.Tray.PollSeconds != 5 {
 		t.Fatalf("unexpected config %+v", c)
 	}
 }

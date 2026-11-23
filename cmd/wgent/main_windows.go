@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/marr-cloud/wgent/internal/cli"
 	"github.com/marr-cloud/wgent/internal/config"
@@ -56,6 +57,6 @@ func main() {
 		Stderr:     os.Stderr,
 		Service:    serviceOps{},
 		Tray:       &tray.Tray{Client: client, ConfigPath: cfgPath},
-		Version:    version,
+		Version:    cli.ResolveVersion(version, debug.ReadBuildInfo),
 	}))
 }

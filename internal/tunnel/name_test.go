@@ -7,7 +7,7 @@ import (
 )
 
 func TestValidateName(t *testing.T) {
-	valid := []string{"a-ado-cloud", "home_vpn", "x.y+z=1", strings.Repeat("a", 32)}
+	valid := []string{"office-vpn", "home_vpn", "x.y+z=1", strings.Repeat("a", 32)}
 	for _, n := range valid {
 		if err := ValidateName(n); err != nil {
 			t.Errorf("ValidateName(%q) = %v, want nil", n, err)

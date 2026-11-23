@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -84,14 +85,14 @@ func (e *env) run(args ...string) int {
 }
 
 func TestStatusUsesDefault(t *testing.T) {
-	e := setup(t, "a-ado-cloud")
+	e := setup(t, "work")
 	if code := e.run("status"); code != 0 {
 		t.Fatalf("exit %d: %s", code, e.errb.String())
 	}
-	if len(e.client.reqs) != 1 || e.client.reqs[0].Tunnel != "a-ado-cloud" || e.client.reqs[0].Op != api.OpStatus {
+	if len(e.client.reqs) != 1 || e.client.reqs[0].Tunnel != "work" || e.client.reqs[0].Op != api.OpStatus {
 		t.Fatalf("reqs = %+v", e.client.reqs)
 	}
-	if got := e.out.String(); got != "a-ado-cloud: up\n" {
+	if got := e.out.String(); got != "work: up\n" {
 		t.Fatalf("out = %q", got)
 	}
 }
@@ -230,11 +231,11 @@ func TestStatusHumanHandshakeAndReason(t *testing.T) {
 	e := setup(t, "w")
 	age := int64(12)
 	e.client.fn = func(api.Request) (api.Response, error) {
-		return api.Response{Status: &api.Status{Tunnel: "a-ado-cloud", State: health.StateDegraded, Reason: "handshake stale",
+		return api.Response{Status: &api.Status{Tunnel: "work", State: health.StateDegraded, Reason: "handshake stale",
 			Peers: []api.PeerInfo{{HandshakeAgeS: &age, RxBytes: 1229, TxBytes: 5632}}}}, nil
 	}
 	e.run("status")
-	want := "a-ado-cloud: degraded (handshake 12s ago, rx 1.2 KiB, tx 5.5 KiB) — handshake stale\n"
+	want := "work: degraded (handshake 12s ago, rx 1.2 KiB, tx 5.5 KiB) — handshake stale\n"
 	if e.out.String() != want {
 		t.Fatalf("out = %q", e.out.String())
 	}
@@ -402,6 +403,46 @@ func TestFormatSize(t *testing.T) {
 	for in, want := range cases {
 		if got := formatSize(in); got != want {
 			t.Errorf("formatSize(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// list does not need the default tunnel, so a broken config must not fail it.
+func TestListWithMalformedConfig(t *testing.T) {
+	e := setup(t, "x")
+	if err := os.WriteFile(e.cfg, []byte("default_tunnel = [broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.client.fn = func(api.Request) (api.Response, error) {
+		return api.Response{Tunnels: []api.Status{{Tunnel: "a", State: health.StateDown}}}, nil
+	}
+	if code := e.run("list", "--json"); code != 0 {
+		t.Fatalf("exit %d: %s", code, e.out.String())
+	}
+	if !strings.Contains(e.out.String(), `"default_tunnel":""`) || !strings.Contains(e.errb.String(), "warning") {
+		t.Fatalf("out = %q, err = %q", e.out.String(), e.errb.String())
+	}
+}
+
+func TestResolveVersion(t *testing.T) {
+	info := func(v string) func() (*debug.BuildInfo, bool) {
+		return func() (*debug.BuildInfo, bool) { return &debug.BuildInfo{Main: debug.Module{Version: v}}, true }
+	}
+	none := func() (*debug.BuildInfo, bool) { return nil, false }
+	cases := []struct {
+		ldflags string
+		info    func() (*debug.BuildInfo, bool)
+		want    string
+	}{
+		{"v0.1.0", info("v0.2.0"), "v0.1.0"}, // ldflags win
+		{"dev", info("v0.1.0"), "v0.1.0"},    // go install module@version
+		{"dev", info("(devel)"), "dev"},      // local go build
+		{"dev", info(""), "dev"},
+		{"dev", none, "dev"},
+	}
+	for _, c := range cases {
+		if got := ResolveVersion(c.ldflags, c.info); got != c.want {
+			t.Errorf("ResolveVersion(%q) = %q, want %q", c.ldflags, got, c.want)
 		}
 	}
 }
