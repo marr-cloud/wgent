@@ -1,6 +1,8 @@
 # wgent — diseño
 
-Fecha: 2026-11-23 · Estado: borrador para aprobación
+Fecha: 2026-11-23 · Estado: aprobado
+
+Decisiones del usuario: README y mensajes en inglés; publicar en GitHub (`marr-cloud/wgent`); al terminar, borrar el prototipo (tareas `vpn-on`/`vpn-off` y scripts `vpn*`).
 
 ## Intención
 
