@@ -11,6 +11,7 @@ import (
 	"github.com/marr-cloud/wgent/internal/config"
 	"github.com/marr-cloud/wgent/internal/ipc"
 	"github.com/marr-cloud/wgent/internal/svc"
+	"github.com/marr-cloud/wgent/internal/tray"
 )
 
 // version is set with -ldflags "-X main.version=...".
@@ -41,28 +42,20 @@ func (serviceOps) Uninstall() error {
 func (serviceOps) Run(sid string) error { return svc.Run(sid) }
 func (serviceOps) IsElevated() bool     { return svc.IsElevated() }
 
-// trayStub is replaced by the real tray implementation in a later task.
-type trayStub struct{}
-
-func (trayStub) Spawn() error         { return errors.New("tray not implemented yet") }
-func (trayStub) RunForeground() error { return errors.New("tray not implemented yet") }
-func (trayStub) SetAutostart(bool) error {
-	return errors.New("tray not implemented yet")
-}
-
 func main() {
 	cfgPath, err := config.Path(os.Getenv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	client := ipc.Client{Dial: ipc.Dial}
 	os.Exit(cli.Main(os.Args[1:], cli.Deps{
-		Client:     ipc.Client{Dial: ipc.Dial},
+		Client:     client,
 		ConfigPath: cfgPath,
 		Stdout:     os.Stdout,
 		Stderr:     os.Stderr,
 		Service:    serviceOps{},
-		Tray:       trayStub{},
+		Tray:       &tray.Tray{Client: client, ConfigPath: cfgPath},
 		Version:    version,
 	}))
 }
