@@ -107,3 +107,29 @@ func TestDumpArgsAndError(t *testing.T) {
 		t.Fatalf("args %v", gotArgs)
 	}
 }
+
+func TestResolveProgramFiles(t *testing.T) {
+	bad := func() (string, error) { return "", errors.New("no") }
+	good := func() (string, error) { return `C:\Program Files`, nil }
+	env := func(v string) func(string) string { return func(string) string { return v } }
+	if p, err := resolveProgramFiles(good, env("")); err != nil || p != `C:\Program Files` {
+		t.Fatal(p, err)
+	}
+	if p, err := resolveProgramFiles(bad, env(`D:\PF`)); err != nil || p != `D:\PF` {
+		t.Fatal(p, err)
+	}
+	if _, err := resolveProgramFiles(bad, env("")); err == nil {
+		t.Fatal("want error for empty")
+	}
+	if _, err := resolveProgramFiles(bad, env(`rel\path`)); err == nil {
+		t.Fatal("want error for relative")
+	}
+}
+
+func TestRunErrorNoDanglingColon(t *testing.T) {
+	w := &Windows{WireGuardDir: `C:\WG`, Run: func(string, ...string) ([]byte, error) { return nil, errors.New("boom") }}
+	err := w.UninstallTunnel("a")
+	if err == nil || strings.HasSuffix(err.Error(), ": ") {
+		t.Fatal(err)
+	}
+}

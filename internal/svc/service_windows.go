@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -28,8 +29,17 @@ const (
 	description = "Lets non-elevated users and AI agents start/stop WireGuard tunnels."
 )
 
-func installDir() string  { return filepath.Join(os.Getenv("ProgramFiles"), "wgent") }
-func installPath() string { return filepath.Join(installDir(), "wgent.exe") }
+// ErrRemovalDeferred means the install directory could not be removed now and
+// the executable is scheduled for deletion at the next reboot.
+var ErrRemovalDeferred = errors.New("wgent.exe is in use; it will be removed after reboot")
+
+func installDir() (string, error) {
+	pf, err := platform.ProgramFiles()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(pf, "wgent"), nil
+}
 
 // CurrentUserSID returns the SID string of the current process's user.
 func CurrentUserSID() (string, error) {
@@ -53,11 +63,71 @@ func waitState(s *mgr.Service, want winsvc.State, timeout time.Duration) error {
 		if st.State == want {
 			return nil
 		}
+		if want == winsvc.Running && st.State == winsvc.Stopped {
+			return fmt.Errorf("service stopped unexpectedly (exit code %d, service-specific %d); check the Windows event log", st.Win32ExitCode, st.ServiceSpecificExitCode)
+		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out after %s waiting for service state %d (current %d)", timeout, want, st.State)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// stopAndWait stops the service if needed and waits for Stopped.
+func stopAndWait(s *mgr.Service) error {
+	st, err := s.Query()
+	if err != nil {
+		return fmt.Errorf("query service: %w", err)
+	}
+	if st.State == winsvc.Stopped {
+		return nil
+	}
+	if st.State != winsvc.StopPending {
+		if _, err := s.Control(winsvc.Stop); err != nil &&
+			!errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) &&
+			!errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+			return err
+		}
+	}
+	return waitState(s, winsvc.Stopped, 20*time.Second)
+}
+
+// retry runs f until it succeeds or ~5 s pass.
+func retry(f func() error) error {
+	var err error
+	for i := 0; i < 25; i++ {
+		if err = f(); err == nil {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return err
+}
+
+// removeInstallDir removes dir after checking it really is a wgent install
+// directory. If files stay locked, the exe is scheduled for deletion at reboot.
+func removeInstallDir(dir string) error {
+	if !filepath.IsAbs(dir) || !strings.EqualFold(filepath.Base(dir), "wgent") {
+		return fmt.Errorf("refusing to remove unexpected directory %q", dir)
+	}
+	err := retry(func() error { return os.RemoveAll(dir) })
+	if err == nil {
+		return nil
+	}
+	exe := filepath.Join(dir, "wgent.exe")
+	if _, serr := os.Stat(exe); serr != nil {
+		return fmt.Errorf("remove %s: %w", dir, err)
+	}
+	for _, p := range []string{exe, dir} {
+		pp, perr := windows.UTF16PtrFromString(p)
+		if perr != nil {
+			return perr
+		}
+		if merr := windows.MoveFileEx(pp, nil, windows.MOVEFILE_DELAY_UNTIL_REBOOT); merr != nil {
+			return fmt.Errorf("remove %s: %w (scheduling deletion failed: %v)", dir, err, merr)
+		}
+	}
+	return ErrRemovalDeferred
 }
 
 func copyExe(src, dst string) error {
@@ -83,7 +153,7 @@ func copyExe(src, dst string) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("write executable: %w", err)
 	}
-	if err := os.Rename(tmpName, dst); err != nil {
+	if err := retry(func() error { return os.Rename(tmpName, dst) }); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("replace %s: %w", dst, err)
 	}
@@ -105,24 +175,20 @@ func Install(selfPath, userSID string) error {
 	}
 	defer m.Disconnect()
 
-	dst := installPath()
+	if err := ipc.ValidateSID(userSID); err != nil {
+		return err
+	}
+	dir, err := installDir()
+	if err != nil {
+		return err
+	}
+	dst := filepath.Join(dir, "wgent.exe")
 	s, err := m.OpenService(serviceName)
 	exists := err == nil
 	if exists {
 		defer s.Close()
-		st, qerr := s.Query()
-		if qerr != nil {
-			return fmt.Errorf("query service: %w", qerr)
-		}
-		if st.State != winsvc.Stopped {
-			if st.State != winsvc.StopPending {
-				if _, err := s.Control(winsvc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
-					return fmt.Errorf("stop existing service: %w", err)
-				}
-			}
-			if err := waitState(s, winsvc.Stopped, 20*time.Second); err != nil {
-				return fmt.Errorf("stop existing service: %w", err)
-			}
+		if err := stopAndWait(s); err != nil {
+			return fmt.Errorf("stop existing service: %w", err)
 		}
 	} else if !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return fmt.Errorf("open service: %w", err)
@@ -142,6 +208,8 @@ func Install(selfPath, userSID string) error {
 		}
 		cfg.BinaryPathName = quoteCmd(dst, args)
 		cfg.StartType = mgr.StartAutomatic
+		cfg.ServiceStartName = "LocalSystem"
+		cfg.Password = ""
 		cfg.DisplayName = displayName
 		cfg.Description = description
 		if err := s.UpdateConfig(cfg); err != nil {
@@ -149,9 +217,10 @@ func Install(selfPath, userSID string) error {
 		}
 	} else {
 		s, err = m.CreateService(serviceName, dst, mgr.Config{
-			StartType:   mgr.StartAutomatic,
-			DisplayName: displayName,
-			Description: description,
+			StartType:        mgr.StartAutomatic,
+			ServiceStartName: "LocalSystem",
+			DisplayName:      displayName,
+			Description:      description,
 		}, args...)
 		if err != nil {
 			return fmt.Errorf("create service: %w", err)
@@ -186,13 +255,8 @@ func Uninstall() error {
 	s, err := m.OpenService(serviceName)
 	if err == nil {
 		defer s.Close()
-		if st, qerr := s.Query(); qerr == nil && st.State != winsvc.Stopped {
-			if _, err := s.Control(winsvc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
-				return fmt.Errorf("stop service: %w", err)
-			}
-			if err := waitState(s, winsvc.Stopped, 20*time.Second); err != nil {
-				return fmt.Errorf("stop service: %w", err)
-			}
+		if err := stopAndWait(s); err != nil {
+			return fmt.Errorf("stop service: %w", err)
 		}
 		if err := s.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
 			return fmt.Errorf("delete service: %w", err)
@@ -200,10 +264,11 @@ func Uninstall() error {
 	} else if !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return fmt.Errorf("open service: %w", err)
 	}
-	if err := os.RemoveAll(installDir()); err != nil {
-		return fmt.Errorf("remove %s: %w", installDir(), err)
+	dir, err := installDir()
+	if err != nil {
+		return err
 	}
-	return nil
+	return removeInstallDir(dir)
 }
 
 // Run runs the wgent service under the SCM, serving the named pipe for userSID.

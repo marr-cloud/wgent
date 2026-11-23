@@ -41,3 +41,15 @@ func TestPipeRoundTrip(t *testing.T) {
 		t.Errorf("unexpected: %+v", resp)
 	}
 }
+
+func TestListenRejectsBadSID(t *testing.T) {
+	for _, s := range []string{"WD", `S-1-5-21-1)(A;;GA;;;WD`, ""} {
+		if l, err := Listen(s); err == nil {
+			l.Close()
+			t.Errorf("Listen(%q) succeeded", s)
+		}
+	}
+	if err := ValidateSID("S-1-5-18"); err != nil {
+		t.Errorf("valid SID rejected: %v", err)
+	}
+}

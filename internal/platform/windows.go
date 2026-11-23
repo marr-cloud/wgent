@@ -27,16 +27,40 @@ const createNoWindow = 0x08000000
 type Windows struct {
 	WireGuardDir string
 	Run          func(name string, args ...string) ([]byte, error)
+	dirErr       error // set by NewWindows when Program Files cannot be resolved
+}
+
+// ProgramFiles returns the absolute Program Files directory, preferring the
+// known-folder API and falling back to %ProgramFiles%.
+func ProgramFiles() (string, error) {
+	return resolveProgramFiles(func() (string, error) {
+		return windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, 0)
+	}, os.Getenv)
+}
+
+func resolveProgramFiles(known func() (string, error), getenv func(string) string) (string, error) {
+	if p, err := known(); err == nil && filepath.IsAbs(p) {
+		return p, nil
+	}
+	p := getenv("ProgramFiles")
+	if p == "" {
+		return "", errors.New("cannot determine the Program Files directory")
+	}
+	if !filepath.IsAbs(p) {
+		return "", fmt.Errorf("%%ProgramFiles%% is not an absolute path: %q", p)
+	}
+	return p, nil
 }
 
 var _ Platform = (*Windows)(nil)
 
 // NewWindows returns a Platform rooted at %ProgramFiles%\WireGuard.
 func NewWindows() *Windows {
-	return &Windows{
-		WireGuardDir: filepath.Join(os.Getenv("ProgramFiles"), "WireGuard"),
-		Run:          runHidden,
+	pf, err := ProgramFiles()
+	if err != nil {
+		return &Windows{Run: runHidden, dirErr: err}
 	}
+	return &Windows{WireGuardDir: filepath.Join(pf, "WireGuard"), Run: runHidden}
 }
 
 func runHidden(name string, args ...string) ([]byte, error) {
@@ -54,9 +78,16 @@ func (w *Windows) run(exe string, args ...string) ([]byte, error) {
 	if run == nil {
 		run = runHidden
 	}
+	if w.dirErr != nil {
+		return nil, w.dirErr
+	}
 	out, err := run(filepath.Join(w.WireGuardDir, exe), args...)
 	if err != nil {
-		return out, fmt.Errorf("%s %s: %w: %s", exe, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		msg := fmt.Sprintf("%s %s: %v", exe, strings.Join(args, " "), err)
+		if o := strings.TrimSpace(string(out)); o != "" {
+			msg += ": " + o
+		}
+		return out, wrapped{msg, err}
 	}
 	return out, nil
 }
@@ -72,6 +103,9 @@ func trimConfSuffix(file string) (string, bool) {
 }
 
 func (w *Windows) ConfigNames() ([]string, error) {
+	if w.dirErr != nil {
+		return nil, w.dirErr
+	}
 	entries, err := os.ReadDir(w.configDir())
 	if errors.Is(err, os.ErrNotExist) {
 		return []string{}, nil
@@ -97,6 +131,9 @@ func (w *Windows) ConfigNames() ([]string, error) {
 }
 
 func (w *Windows) ConfigPath(name string) (string, error) {
+	if w.dirErr != nil {
+		return "", w.dirErr
+	}
 	for _, suf := range []string{".conf.dpapi", ".conf"} {
 		p := filepath.Join(w.configDir(), name+suf)
 		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
@@ -172,3 +209,11 @@ func (w *Windows) Dump(name string) (string, error) {
 	}
 	return string(out), nil
 }
+
+type wrapped struct {
+	msg string
+	err error
+}
+
+func (e wrapped) Error() string { return e.msg }
+func (e wrapped) Unwrap() error { return e.err }
