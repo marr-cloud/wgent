@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	serviceName = "wgent"
+	serviceName = ipc.ServiceName
 	displayName = "wgent (WireGuard for agents)"
 	description = "Lets non-elevated users and AI agents start/stop WireGuard tunnels."
 )
@@ -194,9 +194,18 @@ func Install(selfPath, userSID string) error {
 		return fmt.Errorf("open service: %w", err)
 	}
 
+	// On an update, a failure after stopping the service restarts the
+	// previous binary instead of leaving the service down.
+	fail := func(err error) error {
+		if exists {
+			return restartAfter(func() error { return s.Start() }, err)
+		}
+		return err
+	}
+
 	if !sameFile(selfPath, dst) {
 		if err := copyExe(selfPath, dst); err != nil {
-			return err
+			return fail(err)
 		}
 	}
 
@@ -204,7 +213,7 @@ func Install(selfPath, userSID string) error {
 	if exists {
 		cfg, err := s.Config()
 		if err != nil {
-			return fmt.Errorf("read service config: %w", err)
+			return fail(fmt.Errorf("read service config: %w", err))
 		}
 		cfg.BinaryPathName = quoteCmd(dst, args)
 		cfg.StartType = mgr.StartAutomatic
@@ -213,7 +222,7 @@ func Install(selfPath, userSID string) error {
 		cfg.DisplayName = displayName
 		cfg.Description = description
 		if err := s.UpdateConfig(cfg); err != nil {
-			return fmt.Errorf("update service: %w", err)
+			return fail(fmt.Errorf("update service: %w", err))
 		}
 	} else {
 		s, err = m.CreateService(serviceName, dst, mgr.Config{
@@ -227,6 +236,9 @@ func Install(selfPath, userSID string) error {
 		}
 		defer s.Close()
 	}
+	if err := configureService(s, userSID); err != nil {
+		return fail(err)
+	}
 
 	if err := s.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
 		return fmt.Errorf("start service: %w", err)
@@ -235,6 +247,50 @@ func Install(selfPath, userSID string) error {
 		return fmt.Errorf("start service: %w", err)
 	}
 	return nil
+}
+
+// recoveryActions restarts the service after a failure: 5 s, 10 s, then 30 s;
+// the failure count resets after a day without failures.
+func recoveryActions() ([]mgr.RecoveryAction, uint32) {
+	return []mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
+	}, 24 * 60 * 60
+}
+
+// configureService sets the SCM recovery actions (also for non-crash
+// failures, i.e. a nonzero exit code) and the service DACL that lets userSID
+// query the service, which Dial needs to verify the pipe server.
+func configureService(s *mgr.Service, userSID string) error {
+	actions, reset := recoveryActions()
+	if err := s.SetRecoveryActions(actions, reset); err != nil {
+		return fmt.Errorf("set recovery actions: %w", err)
+	}
+	if err := s.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
+		return fmt.Errorf("set recovery on failure exit: %w", err)
+	}
+	sd, err := windows.SecurityDescriptorFromString(ipc.ServiceSDDL(userSID))
+	if err != nil {
+		return fmt.Errorf("service security descriptor: %w", err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return fmt.Errorf("service security descriptor: %w", err)
+	}
+	if err := windows.SetSecurityInfo(s.Handle, windows.SE_SERVICE, windows.DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		return fmt.Errorf("set service security: %w", err)
+	}
+	return nil
+}
+
+// restartAfter tries to restart the previous service after a failed update
+// and returns err, annotated if the restart failed too.
+func restartAfter(start func() error, err error) error {
+	if serr := start(); serr != nil && !errors.Is(serr, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		return fmt.Errorf("%w (restarting the previous service also failed: %v)", err, serr)
+	}
+	return fmt.Errorf("%w (the previous service was restarted)", err)
 }
 
 func quoteCmd(exe string, args []string) string {

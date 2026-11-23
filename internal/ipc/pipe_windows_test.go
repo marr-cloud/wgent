@@ -72,9 +72,21 @@ func TestPipeSDDL(t *testing.T) {
 	}
 }
 
+func TestServiceSDDL(t *testing.T) {
+	sddl := ServiceSDDL("S-1-5-21-1-2-3-1001")
+	if !strings.HasSuffix(sddl, "(A;;CCLCSWLOCRRC;;;S-1-5-21-1-2-3-1001)") {
+		t.Fatalf("sddl = %q", sddl)
+	}
+	if _, err := windows.SecurityDescriptorFromString(sddl); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPipeRoundTrip(t *testing.T) {
-	path, sid := testPipe(t, "")
-	c := Client{Dial: func() (net.Conn, error) { return dial(path, sid) }}
+	path, _ := testPipe(t, "")
+	var gotPID uint32
+	self := func(pid uint32) error { gotPID = pid; return nil }
+	c := Client{Dial: func() (net.Conn, error) { return dial(path, self) }}
 	resp, err := c.Do(api.Request{Op: api.OpStatus, Tunnel: "home"})
 	if err != nil {
 		t.Fatal(err)
@@ -82,15 +94,18 @@ func TestPipeRoundTrip(t *testing.T) {
 	if resp.Status == nil || resp.Status.Tunnel != "home" {
 		t.Errorf("unexpected: %+v", resp)
 	}
+	if gotPID != uint32(os.Getpid()) {
+		t.Errorf("verified pid %d, want server pid %d", gotPID, os.Getpid())
+	}
 }
 
-// A pipe served by anyone but LocalSystem must be refused (squatting).
-func TestDialRefusesNonSystemServer(t *testing.T) {
+// A pipe served by anything but the wgent service must be refused (squatting).
+func TestDialRefusesNonServiceServer(t *testing.T) {
 	path, _ := testPipe(t, "")
-	conn, err := dial(path, systemSID)
+	conn, err := dial(path, verifyService)
 	if err == nil {
 		conn.Close()
-		t.Fatal("dial succeeded against a non-SYSTEM server")
+		t.Fatal("dial succeeded against a server that is not the wgent service")
 	}
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) || apiErr.Code != api.CodeServiceNotInstalled ||
@@ -119,7 +134,7 @@ func TestUserCannotCreatePipeInstance(t *testing.T) {
 }
 
 func TestDialMissingPipe(t *testing.T) {
-	_, err := dial(`\\.\pipe\wgent-test-does-not-exist`, systemSID)
+	_, err := dial(`\\.\pipe\wgent-test-does-not-exist`, verifyService)
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) || apiErr.Code != api.CodeServiceNotInstalled {
 		t.Fatalf("err = %#v", err)
