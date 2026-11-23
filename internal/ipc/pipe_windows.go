@@ -14,7 +14,7 @@ import (
 	"github.com/marr-cloud/wgent/internal/api"
 )
 
-const PipePath = `\.\pipe\wgent`
+const PipePath = `\\.\pipe\wgent`
 
 // Listen creates the pipe, accessible to SYSTEM, Administrators and userSID.
 func Listen(userSID string) (net.Listener, error) {
