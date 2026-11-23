@@ -152,7 +152,7 @@ func (h *Handler) status(name string) (api.Status, error) {
 		pi := api.PeerInfo{Endpoint: p.Endpoint, RxBytes: p.RxBytes, TxBytes: p.TxBytes}
 		if !p.LastHandshake.IsZero() {
 			hs := p.LastHandshake
-			age := int64(now.Sub(hs) / time.Second)
+			age := max(int64(now.Sub(hs)/time.Second), 0) // clamp clock skew
 			pi.LastHandshake, pi.HandshakeAgeS = &hs, &age
 		}
 		st.Peers = append(st.Peers, pi)
@@ -199,24 +199,40 @@ func (h *Handler) up(ctx context.Context, name string) api.Response {
 		return h.statusResp(name, false)
 	}
 	deadline := h.now().Add(h.timeout())
-	switch svc {
-	case health.SvcMissing:
-		path, err := h.P.ConfigPath(name) // never construct paths ourselves
-		if err != nil {
-			return internalErr(err)
+	if svc == health.SvcStarting || svc == health.SvcStopping {
+		// Transition in progress: wait (same budget) for a settled state, then
+		// decide what to do. A stopping service ends up stopped/missing and
+		// must then be started/installed.
+		if r := h.waitService(ctx, name, "start", deadline, func(s health.ServiceState) bool {
+			return s == health.SvcRunning || s == health.SvcStopped || s == health.SvcMissing
+		}); r != nil {
+			return *r
 		}
-		err = h.P.InstallTunnel(path)
-		if err != nil {
-			return internalErr(err)
-		}
-	case health.SvcStopped:
-		if err := h.P.StartService(name); err != nil {
+		if svc, err = h.P.ServiceState(name); err != nil {
 			return internalErr(err)
 		}
 	}
-	// starting/stopping: just wait.
-	if r := h.waitService(ctx, name, "start", deadline, func(s health.ServiceState) bool { return s == health.SvcRunning }); r != nil {
-		return *r
+	if svc != health.SvcRunning {
+		if ctx.Err() != nil { // never mutate for a cancelled request
+			return ctxResp(name, "start")
+		}
+		switch svc {
+		case health.SvcMissing:
+			path, err := h.P.ConfigPath(name) // never construct paths ourselves
+			if err != nil {
+				return internalErr(err)
+			}
+			if err := h.P.InstallTunnel(path); err != nil {
+				return internalErr(err)
+			}
+		case health.SvcStopped:
+			if err := h.P.StartService(name); err != nil {
+				return internalErr(err)
+			}
+		}
+		if r := h.waitService(ctx, name, "start", deadline, func(s health.ServiceState) bool { return s == health.SvcRunning }); r != nil {
+			return *r
+		}
 	}
 
 	// Service is running; give the first handshake a short window. Whatever
@@ -248,6 +264,9 @@ func (h *Handler) down(ctx context.Context, name string) api.Response {
 	}
 	if svc == health.SvcMissing {
 		return h.statusResp(name, false)
+	}
+	if ctx.Err() != nil { // never mutate for a cancelled request
+		return ctxResp(name, "stop")
 	}
 	deadline := h.now().Add(h.timeout())
 	if err := h.P.UninstallTunnel(name); err != nil {

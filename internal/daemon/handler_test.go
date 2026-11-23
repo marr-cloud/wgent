@@ -26,6 +26,7 @@ type fake struct {
 	onStart func(f *fake, name string) // default: becomes running
 	onInst  func(f *fake, name string)
 	onUnin  func(f *fake, name string)
+	seq     map[string][]health.ServiceState // consumed per ServiceState call; last sticks
 }
 
 func newFake(names ...string) *fake {
@@ -54,6 +55,13 @@ func (f *fake) ConfigPath(n string) (string, error) {
 }
 func (f *fake) ServiceState(n string) (health.ServiceState, error) {
 	f.rec("svc:" + n)
+	if q := f.seq[n]; len(q) > 0 {
+		if len(q) > 1 {
+			f.seq[n] = q[1:]
+		}
+		f.state[n] = q[0]
+		return q[0], nil
+	}
 	if s, ok := f.state[n]; ok {
 		return s, nil
 	}
@@ -254,12 +262,61 @@ func TestUpHandshakeNeverComesIsDegradedNotError(t *testing.T) {
 }
 
 func TestUpContextCancelled(t *testing.T) {
+	for _, st := range []health.ServiceState{health.SvcMissing, health.SvcStopped} {
+		f := newFake("a")
+		if st != health.SvcMissing {
+			f.state["a"] = st
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r := f.handler().Handle(ctx, api.Request{Op: api.OpUp, Tunnel: "a"})
+		wantErr(t, r, api.CodeTimeout)
+		if len(f.mutating()) != 0 {
+			t.Errorf("%s: mutating calls = %v", st, f.mutating())
+		}
+	}
+}
+
+func TestDownContextCancelled(t *testing.T) {
 	f := newFake("a")
-	f.onInst = func(*fake, string) {}
+	f.state["a"] = health.SvcRunning
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	r := f.handler().Handle(ctx, api.Request{Op: api.OpUp, Tunnel: "a"})
-	wantErr(t, r, api.CodeTimeout)
+	wantErr(t, f.handler().Handle(ctx, api.Request{Op: api.OpDown, Tunnel: "a"}), api.CodeTimeout)
+	if len(f.mutating()) != 0 {
+		t.Errorf("mutating calls = %v", f.mutating())
+	}
+}
+
+func TestUpWhileStoppingThenStarts(t *testing.T) {
+	f := newFake("a")
+	f.seq = map[string][]health.ServiceState{"a": {health.SvcStopping, health.SvcStopping, health.SvcStopped}}
+	f.onStart = func(f *fake, n string) { f.seq["a"] = []health.ServiceState{health.SvcRunning} }
+	st := wantOK(t, do(f.handler(), api.OpUp, "a"))
+	if !slices.Equal(f.mutating(), []string{"start:a"}) || !st.Changed || st.Service != health.SvcRunning {
+		t.Errorf("mutating=%v status=%+v", f.mutating(), st)
+	}
+}
+
+func TestUpWhileStartingJustWaits(t *testing.T) {
+	f := newFake("a")
+	f.seq = map[string][]health.ServiceState{"a": {health.SvcStarting, health.SvcStarting, health.SvcRunning}}
+	st := wantOK(t, do(f.handler(), api.OpUp, "a"))
+	if len(f.mutating()) != 0 || !st.Changed || st.Service != health.SvcRunning {
+		t.Errorf("mutating=%v status=%+v", f.mutating(), st)
+	}
+}
+
+func TestHandshakeAgeClampedToZero(t *testing.T) {
+	f := newFake("a")
+	f.state["a"] = health.SvcRunning
+	f.dump = func(string, int) (string, error) {
+		return fmt.Sprintf("P\tK\t1\toff\npeer=\t(none)\t1.2.3.4:1\t10.0.0.2/32\t%d\t1\t2\t0\n", f.now.Unix()+10), nil
+	}
+	st := wantOK(t, do(f.handler(), api.OpStatus, "a"))
+	if p := st.Peers[0]; p.HandshakeAgeS == nil || *p.HandshakeAgeS != 0 {
+		t.Errorf("peer = %+v", p)
+	}
 }
 
 func TestDownUninstalls(t *testing.T) {
