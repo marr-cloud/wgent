@@ -53,7 +53,7 @@ func ParseDump(out string) ([]Peer, error) {
 			p.Endpoint = ""
 		}
 		if hs > 0 {
-			p.LastHandshake = time.Unix(hs, 0)
+			p.LastHandshake = time.Unix(hs, 0).UTC()
 		}
 		peers = append(peers, p)
 	}

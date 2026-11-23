@@ -64,3 +64,13 @@ func TestParseDumpInterfaceOnly(t *testing.T) {
 		t.Fatalf("peers=%v err=%v", peers, err)
 	}
 }
+
+func TestParseDumpHandshakeIsUTC(t *testing.T) {
+	peers, err := ParseDump(dumpTwoPeers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc := peers[0].LastHandshake.Location(); loc != time.UTC {
+		t.Errorf("location = %v, want UTC", loc)
+	}
+}
