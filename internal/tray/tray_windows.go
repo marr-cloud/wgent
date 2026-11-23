@@ -40,6 +40,9 @@ type Tray struct {
 	names     []string  // tunnel names the menu was built for
 	menuGen   chan struct{}
 	items     map[string]*systray.MenuItem
+	icons     IconCache
+	lastView  View
+	haveView  bool
 	kick      chan struct{}
 	stop      chan struct{}
 }
@@ -70,8 +73,10 @@ func (t *Tray) RunForeground() error {
 }
 
 func (t *Tray) onReady() {
-	systray.SetIcon(DotICO(ColorDown))
-	systray.SetTooltip("wgent")
+	t.mu.Lock()
+	t.setView(View{ColorDown, "wgent"})
+	t.mu.Unlock()
+	t.syncMenu(nil, nil) // Quit must exist even while the service is down
 	// Left click toggles the default tunnel; right click opens the menu.
 	systray.SetOnTapped(func() {
 		cfg, err := config.Load(t.ConfigPath)
@@ -95,9 +100,19 @@ func (t *Tray) pollLoop() {
 	}
 }
 
+// setView updates the icon/tooltip only when they changed. Callers hold t.mu
+// or run before the poll loop starts.
 func (t *Tray) setView(v View) {
-	systray.SetIcon(DotICO(v.Color))
-	systray.SetTooltip(v.Tooltip)
+	if t.haveView && v == t.lastView {
+		return
+	}
+	if !t.haveView || v.Color != t.lastView.Color {
+		systray.SetIcon(t.icons.Get(v.Color))
+	}
+	if !t.haveView || v.Tooltip != t.lastView.Tooltip {
+		systray.SetTooltip(v.Tooltip)
+	}
+	t.lastView, t.haveView = v, true
 }
 
 // poll refreshes menu and icon; it returns the poll interval in seconds.
@@ -110,18 +125,15 @@ func (t *Tray) poll() int {
 	}
 	if cerr != nil {
 		t.mu.Lock()
-		busy := t.busy
-		t.mu.Unlock()
-		if !busy {
+		if !t.busy {
 			t.setView(View{ColorError, Truncate("wgent: "+cerr.Error(), MaxTooltip)})
 		}
+		t.mu.Unlock()
 		return secs
 	}
 
 	list, lerr := t.Client.Do(api.Request{Op: api.OpList})
-	if lerr == nil {
-		t.syncMenu(list.Tunnels)
-	}
+	t.syncMenu(list.Tunnels, lerr)
 
 	var st *api.Status
 	var serr error = lerr
@@ -150,11 +162,11 @@ func (t *Tray) poll() int {
 // re-add everything including Quit) only when the set of names changes; on
 // every poll only the checkmarks are updated. Old click-handler goroutines
 // exit via the closed generation channel.
-func (t *Tray) syncMenu(tunnels []api.Status) {
-	names := make([]string, len(tunnels))
-	for i, s := range tunnels {
-		names[i] = s.Tunnel
+func (t *Tray) syncMenu(tunnels []api.Status, listErr error) {
+	if listErr != nil {
+		tunnels = nil
 	}
+	names := MenuNames(tunnels, listErr)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.items == nil || !SameNames(names, t.names) {
@@ -173,7 +185,10 @@ func (t *Tray) syncMenu(tunnels []api.Status) {
 					select {
 					case <-gen:
 						return
-					case <-it.ClickedCh:
+					case _, ok := <-it.ClickedCh:
+						if !ok { // closed by ResetMenu
+							return
+						}
 						go t.toggle(name)
 					}
 				}
@@ -184,8 +199,10 @@ func (t *Tray) syncMenu(tunnels []api.Status) {
 		go func(gen chan struct{}) {
 			select {
 			case <-gen:
-			case <-quit.ClickedCh:
-				systray.Quit()
+			case _, ok := <-quit.ClickedCh:
+				if ok {
+					systray.Quit()
+				}
 			}
 		}(t.menuGen)
 		t.names = names

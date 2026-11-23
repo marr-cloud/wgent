@@ -129,3 +129,32 @@ func DotICO(c color.RGBA) []byte {
 	out.Write(pngBuf.Bytes())
 	return out.Bytes()
 }
+
+// MenuNames returns the tunnel names to show in the menu. When list failed
+// there are none, so only Quit remains (no stale items).
+func MenuNames(tunnels []api.Status, listErr error) []string {
+	if listErr != nil {
+		return nil
+	}
+	names := make([]string, len(tunnels))
+	for i, s := range tunnels {
+		names[i] = s.Tunnel
+	}
+	return names
+}
+
+// IconCache memoizes DotICO per color.
+type IconCache struct{ m map[color.RGBA][]byte }
+
+// Get returns the ICO bytes for c, rendering them on first use.
+func (ic *IconCache) Get(c color.RGBA) []byte {
+	if ic.m == nil {
+		ic.m = map[color.RGBA][]byte{}
+	}
+	b, ok := ic.m[c]
+	if !ok {
+		b = DotICO(c)
+		ic.m[c] = b
+	}
+	return b
+}

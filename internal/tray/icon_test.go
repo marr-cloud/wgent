@@ -3,6 +3,7 @@ package tray
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"image/color"
 	"image/png"
 	"strings"
@@ -114,5 +115,26 @@ func TestAutostartCommand(t *testing.T) {
 	want := `"C:\Windows\System32\conhost.exe" --headless "C:\Program Files\wgent\wgent.exe" tray --foreground`
 	if got != want {
 		t.Errorf("got %s\nwant %s", got, want)
+	}
+}
+
+func TestMenuNames(t *testing.T) {
+	ts := []api.Status{{Tunnel: "a"}, {Tunnel: "b"}}
+	if got := MenuNames(ts, nil); !SameNames(got, []string{"a", "b"}) {
+		t.Errorf("got %v", got)
+	}
+	if got := MenuNames(ts, errors.New("boom")); len(got) != 0 {
+		t.Errorf("list failed: got %v, want none", got)
+	}
+}
+
+func TestIconCache(t *testing.T) {
+	var ic IconCache
+	a, b := ic.Get(ColorUp), ic.Get(ColorUp)
+	if &a[0] != &b[0] {
+		t.Error("not cached")
+	}
+	if bytes.Equal(a, ic.Get(ColorError)) {
+		t.Error("different colors share bytes")
 	}
 }
