@@ -6,7 +6,7 @@ Decisiones del usuario: README y mensajes en inglés; publicar en GitHub (`marr-
 
 ## Intención
 
-`wgent` es un wrapper de WireGuard para Windows pensado para **agentes de IA** (y para Mauricio desde la terminal). Hoy existe un prototipo en PowerShell (`~/.local/bin/vpn*.ps1` + tareas programadas `vpn-on`/`vpn-off`) que solo sirve para un túnel fijo (`a-ado-cloud`). El objetivo es un binario único, configurable y con un README bien hecho.
+`wgent` es un wrapper de WireGuard para Windows pensado para **agentes de IA** (y para el usuario desde la terminal). Hoy existe un prototipo en PowerShell (`~/.local/bin/vpn*.ps1` + tareas programadas `vpn-on`/`vpn-off`) que solo sirve para un túnel fijo (`work`). El objetivo es un binario único, configurable y con un README bien hecho.
 
 Por qué: que un agente pueda **encender/apagar un túnel sin que el humano intervenga** (sin UAC) y **saber con certeza el estado**: encendido, apagado o con problemas.
 
@@ -61,13 +61,13 @@ Un solo ejecutable `wgent.exe` con dos roles:
 ### Seguridad del pipe
 
 - El DACL del pipe permite acceso solo a SYSTEM, Administradores y **el SID del usuario que instaló el servicio** (guardado en la configuración del servicio en el registro al instalar). SDDL: `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;<SID>)`; el usuario tiene lectura/escritura pero no `FILE_CREATE_PIPE_INSTANCE`, así que no puede crear instancias de servidor del pipe.
-- El cliente verifica que el proceso servidor del pipe corre como LocalSystem (`S-1-5-18`, vía `GetNamedPipeServerProcessId` y el token del proceso). Si no, rechaza la conexión (exit 3, "pipe server is not the wgent service"): evita que otro proceso ocupe el pipe y suplante el estado.
+- El cliente verifica que el proceso servidor del pipe es el servicio `wgent` y que este corre como LocalSystem (`S-1-5-18`): compara `GetNamedPipeServerProcessId` con el PID que da el SCM y exige `LocalSystem` como cuenta del servicio. (Un usuario estándar no puede abrir el token de un proceso SYSTEM, así que el SCM es la autoridad.) `service install` da al usuario permiso de consulta sobre el servicio `wgent`. Si no se cumple, rechaza la conexión (exit 3, "pipe server is not the wgent service"): evita que otro proceso ocupe el pipe y suplante el estado.
 - Protocolo cerrado: mensajes JSON con `op ∈ {list, status, up, down}` y `tunnel` (string). El nombre se valida contra `^[A-Za-z0-9_=+.-]{1,32}$` (regla de nombres de WireGuard) y debe existir en el directorio de configuraciones de WireGuard. Nada de rutas.
 
 ### Operaciones del servicio
 
 - `list`: lee el directorio de configuraciones (`*.conf.dpapi`, `*.conf`) → nombres + si están activos.
-- `up`: si ya existe el servicio `WireGuardTunnel$<n>` y está parado, lo inicia; si no existe, ejecuta `wireguard.exe /installtunnelservice <ruta>` (CLI estable y documentada de WireGuard). Espera hasta que el servicio esté `Running` o venza un timeout (15 s).
+- `up`: si ya existe el servicio `WireGuardTunnel$<n>` y está parado, lo inicia; si no existe, ejecuta `wireguard.exe /installtunnelservice <ruta>` (CLI estable y documentada de WireGuard). Espera hasta que el servicio esté `Running` o venza un timeout (15 s). Si el servicio se para o falla después de pedir el arranque, `up` devuelve el error con la causa enseguida, sin esperar al timeout. `up`/`down` se serializan por túnel en el servicio.
 - `down`: `wireguard.exe /uninstalltunnelservice <n>`; espera a que el servicio desaparezca.
 - `status`: estado del servicio del túnel + estadísticas vía `wg.exe show <n> dump` (formato tabulado para máquinas: último handshake por peer, rx/tx). Revisión 2026-11-23: se descartó el paquete `driver` de wireguard-windows porque requiere `wireguard.dll`, que la instalación oficial no deja en System32 (va embebido en `wireguard.exe`).
 
@@ -78,7 +78,7 @@ Un solo ejecutable `wgent.exe` con dos roles:
 | `down` | No existe el servicio del túnel o está parado. |
 | `up` | Servicio en `Running` y algún peer con handshake hace < 180 s. |
 | `degraded` | Servicio en `Running` pero sin handshake o el último > 180 s. Incluye `reason`. |
-| `error` | El servicio del túnel falló, o no se pudieron leer estadísticas. Incluye `reason`. |
+| `error` | El servicio del túnel falló (parado con código de salida ≠ 0: `service: failed`, el `reason` incluye el código), está en pausa, o no se pudieron leer estadísticas. Incluye `reason`. |
 
 Nota: sin tráfico ni `PersistentKeepalive`, un túnel sano puede no hacer handshake durante un rato; el `reason` lo dice ("sin handshake reciente; puede ser inactividad si no hay keepalive") y el README lo explica.
 
@@ -105,7 +105,7 @@ wgent version
 
 ```json
 {
-  "tunnel": "a-ado-cloud",
+  "tunnel": "work",
   "state": "up",
   "reason": "",
   "changed": true,
@@ -132,7 +132,7 @@ Errores en JSON: `{"error": {"code": "service_not_installed", "message": "...", 
 `%USERPROFILE%\.config\wgent\config.toml` (respeta `XDG_CONFIG_HOME` si existe):
 
 ```toml
-default_tunnel = "a-ado-cloud"
+default_tunnel = "work"
 
 [tray]
 poll_seconds = 2
@@ -142,7 +142,7 @@ Si no existe, se usa sin default. `wgent config set-default` la crea.
 
 ## Bandeja
 
-- `wgent tray`: una instancia (mutex), icono verde/gris/ámbar (cambiando)/rojo (`degraded`/`error`), tooltip con estado y túnel, notificación al cambiar.
+- `wgent tray`: una instancia (mutex), icono verde/gris/ámbar (cambiando)/rojo (`degraded`/`error`), tooltip con estado y túnel. El cambio de estado se ve en el icono y el tooltip; no hay notificaciones emergentes (`fyne.io/systray` no tiene API de notificaciones; ver "Known limitations" en el README).
 - Clic izquierdo: `toggle` del túnel por defecto. Menú: lista de túneles con check en los activos, "Salir".
 - `--autostart on|off`: crea/quita la entrada en `HKCU\...\Run`.
 - El binario es de consola (no `-H windowsgui`, para que la CLI siga funcionando). `wgent tray` se relanza a sí mismo desacoplado y sin ventana (`DETACHED_PROCESS`/`CREATE_NO_WINDOW`) y devuelve el control a la terminal.
