@@ -117,6 +117,9 @@ func TestDialRefusesNonServiceServer(t *testing.T) {
 // The authorized user must not be able to add server instances to the pipe
 // with the production SDDL, while a GA grant would allow it (control).
 func TestUserCannotCreatePipeInstance(t *testing.T) {
+	if windows.GetCurrentProcessToken().IsElevated() {
+		t.Skip("elevated token: Administrators hold GA on the pipe (e.g. CI runners)")
+	}
 	path := testPipePath(t)
 	l, err := listen(path, currentSID(t))
 	if err != nil {
