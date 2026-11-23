@@ -249,7 +249,8 @@ The tray dot reflects the default tunnel: green is `up`, grey is `down` or unkno
 ## Security model
 
 - The service runs as LocalSystem, but accepts only four operations: `list`, `status`, `up`, `down`, each with a validated tunnel name that must exist in the WireGuard configurations directory. It never accepts file paths or arbitrary commands, so it cannot be used to run or import arbitrary configs.
-- The named pipe `\\.\pipe\wgent` is accessible only to SYSTEM, Administrators and the SID of the user who ran `wgent service install`. Other local users cannot talk to it.
+- The named pipe `\\.\pipe\wgent` is accessible only to SYSTEM, Administrators and the SID of the user who ran `wgent service install`. Other local users cannot talk to it. The DACL is `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;<SID>)`: your user gets read/write but not `FILE_CREATE_PIPE_INSTANCE`, so it cannot add a server instance of its own to the pipe.
+- The CLI refuses to talk to a pipe whose server process does not run as LocalSystem (`S-1-5-18`), so a process that grabs `\\.\pipe\wgent` while the service is stopped cannot fake a tunnel state. It fails with exit 3 and "pipe server is not the wgent service".
 - The service binary is copied to `%ProgramFiles%\wgent\wgent.exe`, a location non-admin users cannot write to, so the SYSTEM service cannot be hijacked by replacing a user-writable binary.
 - Anyone who can already run code as the installing user can start and stop your tunnels. That is the point; it does not grant access to tunnel keys or configs.
 

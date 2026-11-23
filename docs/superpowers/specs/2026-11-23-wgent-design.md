@@ -60,7 +60,8 @@ Un solo ejecutable `wgent.exe` con dos roles:
 
 ### Seguridad del pipe
 
-- El DACL del pipe permite acceso solo a SYSTEM, Administradores y **el SID del usuario que instaló el servicio** (guardado en la configuración del servicio en el registro al instalar).
+- El DACL del pipe permite acceso solo a SYSTEM, Administradores y **el SID del usuario que instaló el servicio** (guardado en la configuración del servicio en el registro al instalar). SDDL: `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;<SID>)`; el usuario tiene lectura/escritura pero no `FILE_CREATE_PIPE_INSTANCE`, así que no puede crear instancias de servidor del pipe.
+- El cliente verifica que el proceso servidor del pipe corre como LocalSystem (`S-1-5-18`, vía `GetNamedPipeServerProcessId` y el token del proceso). Si no, rechaza la conexión (exit 3, "pipe server is not the wgent service"): evita que otro proceso ocupe el pipe y suplante el estado.
 - Protocolo cerrado: mensajes JSON con `op ∈ {list, status, up, down}` y `tunnel` (string). El nombre se valida contra `^[A-Za-z0-9_=+.-]{1,32}$` (regla de nombres de WireGuard) y debe existir en el directorio de configuraciones de WireGuard. Nada de rutas.
 
 ### Operaciones del servicio
