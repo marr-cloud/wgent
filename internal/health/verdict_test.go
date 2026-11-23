@@ -80,3 +80,36 @@ func TestVerdictUsesNewestPeer(t *testing.T) {
 		t.Errorf("%s", st)
 	}
 }
+
+func TestVerdictFailed(t *testing.T) {
+	st, r := Verdict(SvcFailed, nil, nil, now)
+	if st != StateError || r != "tunnel service failed; see the WireGuard log" {
+		t.Errorf("%s %q", st, r)
+	}
+	if got := FailedReason(1066); got != "tunnel service failed (exit code 1066); see the WireGuard log" {
+		t.Errorf("FailedReason = %q", got)
+	}
+}
+
+func TestVerdictPaused(t *testing.T) {
+	if st, r := Verdict(SvcPaused, nil, nil, now); st != StateError || r != "tunnel service is paused" {
+		t.Errorf("%s %q", st, r)
+	}
+}
+
+func TestVerdictUnknownServiceIsError(t *testing.T) {
+	if st, _ := Verdict(SvcUnknown, nil, nil, now); st != StateError {
+		t.Errorf("%s", st)
+	}
+}
+
+// A handshake in the future (clock moved back) must not count as fresh.
+func TestVerdictFutureHandshake(t *testing.T) {
+	st, r := Verdict(SvcRunning, []Peer{peerAgo(-10 * time.Minute)}, nil, now)
+	if st != StateDegraded || r != "handshake timestamp in the future (clock change?)" {
+		t.Errorf("%s %q", st, r)
+	}
+	if st, _ := Verdict(SvcRunning, []Peer{peerAgo(-10 * time.Second)}, nil, now); st != StateUp {
+		t.Errorf("small skew: %s", st)
+	}
+}

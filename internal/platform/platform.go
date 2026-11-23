@@ -14,8 +14,9 @@ type Platform interface {
 	ConfigNames() ([]string, error)
 	// ConfigPath prefers .conf.dpapi; returns os.ErrNotExist if none.
 	ConfigPath(name string) (string, error)
-	// ServiceState reports SvcMissing when the tunnel service doesn't exist.
-	ServiceState(name string) (health.ServiceState, error)
+	// ServiceState reports SvcMissing when the tunnel service doesn't exist
+	// and, for SvcFailed, the service's exit code.
+	ServiceState(name string) (health.ServiceState, uint32, error)
 	StartService(name string) error
 	// InstallTunnel runs wireguard.exe /installtunnelservice <confPath>.
 	InstallTunnel(confPath string) error

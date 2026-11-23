@@ -145,33 +145,49 @@ func (w *Windows) ConfigPath(name string) (string, error) {
 
 func tunnelServiceName(name string) string { return "WireGuardTunnel$" + name }
 
-func (w *Windows) ServiceState(name string) (health.ServiceState, error) {
+func (w *Windows) ServiceState(name string) (health.ServiceState, uint32, error) {
 	m, err := mgr.Connect()
 	if err != nil {
-		return "", fmt.Errorf("connect to service manager: %w", err)
+		return "", 0, fmt.Errorf("connect to service manager: %w", err)
 	}
 	defer m.Disconnect()
 	s, err := m.OpenService(tunnelServiceName(name))
 	if err != nil {
 		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) || errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-			return health.SvcMissing, nil
+			return health.SvcMissing, 0, nil
 		}
-		return "", fmt.Errorf("open service: %w", err)
+		return "", 0, fmt.Errorf("open service: %w", err)
 	}
 	defer s.Close()
 	st, err := s.Query()
 	if err != nil {
-		return "", fmt.Errorf("query service: %w", err)
+		return "", 0, fmt.Errorf("query service: %w", err)
 	}
+	state, code := mapStatus(st)
+	return state, code, nil
+}
+
+// mapStatus maps an SCM status to a ServiceState plus, for a failed
+// service, its exit code (the service-specific one when the service set it).
+func mapStatus(st svc.Status) (health.ServiceState, uint32) {
 	switch st.State {
 	case svc.Stopped:
-		return health.SvcStopped, nil
+		switch st.Win32ExitCode {
+		case 0:
+			return health.SvcStopped, 0
+		case uint32(windows.ERROR_SERVICE_SPECIFIC_ERROR):
+			return health.SvcFailed, st.ServiceSpecificExitCode
+		default:
+			return health.SvcFailed, st.Win32ExitCode
+		}
 	case svc.StartPending, svc.ContinuePending:
-		return health.SvcStarting, nil
+		return health.SvcStarting, 0
 	case svc.Running:
-		return health.SvcRunning, nil
-	default:
-		return health.SvcStopping, nil
+		return health.SvcRunning, 0
+	case svc.Paused, svc.PausePending:
+		return health.SvcPaused, 0
+	default: // StopPending
+		return health.SvcStopping, 0
 	}
 }
 

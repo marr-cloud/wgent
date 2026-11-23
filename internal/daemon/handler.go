@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/marr-cloud/wgent/internal/api"
@@ -32,6 +33,30 @@ type Handler struct {
 	Sleep   func(time.Duration)
 	Timeout time.Duration
 	Poll    time.Duration
+
+	mu    sync.Mutex
+	locks map[string]chan struct{} // per-tunnel lock for up/down
+}
+
+// lock serializes mutating operations on one tunnel. It gives up (ok=false)
+// if ctx ends first.
+func (h *Handler) lock(ctx context.Context, name string) (unlock func(), ok bool) {
+	h.mu.Lock()
+	if h.locks == nil {
+		h.locks = map[string]chan struct{}{}
+	}
+	l, found := h.locks[name]
+	if !found {
+		l = make(chan struct{}, 1)
+		h.locks[name] = l
+	}
+	h.mu.Unlock()
+	select {
+	case l <- struct{}{}:
+		return func() { <-l }, true
+	case <-ctx.Done():
+		return nil, false
+	}
 }
 
 func (h *Handler) timeout() time.Duration {
@@ -101,18 +126,28 @@ func (h *Handler) handle(ctx context.Context, req api.Request) api.Response {
 		return errResp(api.CodeTunnelNotFound, fmt.Sprintf("tunnel %q not found", name), `run "wgent list"`)
 	}
 
-	switch req.Op {
-	case api.OpStatus:
+	if req.Op == api.OpStatus {
 		st, err := h.status(name)
 		if err != nil {
 			return internalErr(err)
 		}
 		return api.Response{Status: &st}
-	case api.OpUp:
-		return h.up(ctx, name)
-	default:
-		return h.down(ctx, name)
 	}
+	// up/down (and so toggle) are serialized per tunnel: a second concurrent
+	// request sees the result of the first instead of racing it.
+	what := "start"
+	if req.Op == api.OpDown {
+		what = "stop"
+	}
+	unlock, ok := h.lock(ctx, name)
+	if !ok {
+		return ctxResp(name, what)
+	}
+	defer unlock()
+	if req.Op == api.OpUp {
+		return h.up(ctx, name)
+	}
+	return h.down(ctx, name)
 }
 
 func (h *Handler) list() api.Response {
@@ -124,7 +159,7 @@ func (h *Handler) list() api.Response {
 	for _, n := range names {
 		st, err := h.status(n)
 		if err != nil {
-			st = api.Status{Tunnel: n, State: health.StateError, Reason: err.Error(), Peers: []api.PeerInfo{}}
+			st = api.Status{Tunnel: n, State: health.StateError, Reason: err.Error(), Service: health.SvcUnknown, Peers: []api.PeerInfo{}}
 		}
 		out = append(out, st)
 	}
@@ -133,7 +168,7 @@ func (h *Handler) list() api.Response {
 
 // status builds the Status for a name already known to exist in the configs.
 func (h *Handler) status(name string) (api.Status, error) {
-	svc, err := h.P.ServiceState(name)
+	svc, code, err := h.P.ServiceState(name)
 	if err != nil {
 		return api.Status{}, err
 	}
@@ -148,6 +183,9 @@ func (h *Handler) status(name string) (api.Status, error) {
 		}
 	}
 	st.State, st.Reason = health.Verdict(svc, peers, statsErr, now)
+	if svc == health.SvcFailed {
+		st.Reason = health.FailedReason(code)
+	}
 	for _, p := range peers {
 		pi := api.PeerInfo{Endpoint: p.Endpoint, RxBytes: p.RxBytes, TxBytes: p.TxBytes}
 		if !p.LastHandshake.IsZero() {
@@ -167,20 +205,26 @@ func ctxResp(name, what string) api.Response {
 }
 
 // waitService polls ServiceState until pred holds; it returns nil on success
-// and an error response otherwise.
-func (h *Handler) waitService(ctx context.Context, name, what string, deadline time.Time, pred func(health.ServiceState) bool) *api.Response {
+// and an error response otherwise. fail, if set, may end the wait early with
+// an error for states the service will not leave on its own.
+func (h *Handler) waitService(ctx context.Context, name, what string, deadline time.Time, pred func(health.ServiceState) bool, fail func(health.ServiceState, uint32) *api.Response) *api.Response {
 	for {
 		if ctx.Err() != nil {
 			r := ctxResp(name, what)
 			return &r
 		}
-		s, err := h.P.ServiceState(name)
+		s, code, err := h.P.ServiceState(name)
 		if err != nil {
 			r := internalErr(err)
 			return &r
 		}
 		if pred(s) {
 			return nil
+		}
+		if fail != nil {
+			if r := fail(s, code); r != nil {
+				return r
+			}
 		}
 		if !h.now().Before(deadline) {
 			r := errResp(api.CodeTimeout, fmt.Sprintf("timed out waiting for tunnel %q to %s", name, what), "")
@@ -190,13 +234,37 @@ func (h *Handler) waitService(ctx context.Context, name, what string, deadline t
 	}
 }
 
+// startFailed ends a start wait once the service stopped after we asked it to
+// start: it will not come back on its own, so report the cause now.
+func startFailed(name string) func(health.ServiceState, uint32) *api.Response {
+	return func(s health.ServiceState, code uint32) *api.Response {
+		var r api.Response
+		switch s {
+		case health.SvcFailed:
+			r = errResp(api.CodeInternal, fmt.Sprintf("tunnel %q: %s", name, health.FailedReason(code)), "")
+		case health.SvcStopped:
+			r = errResp(api.CodeInternal, fmt.Sprintf("tunnel %q service stopped while starting; see the WireGuard log", name), "")
+		default:
+			return nil
+		}
+		return &r
+	}
+}
+
+func pausedErr(name string) api.Response {
+	return errResp(api.CodeInternal, fmt.Sprintf("tunnel %q service is paused; resume it or run \"wgent down %s\"", name, name), "")
+}
+
 func (h *Handler) up(ctx context.Context, name string) api.Response {
-	svc, err := h.P.ServiceState(name)
+	svc, _, err := h.P.ServiceState(name)
 	if err != nil {
 		return internalErr(err)
 	}
 	if svc == health.SvcRunning {
 		return h.statusResp(name, false)
+	}
+	if svc == health.SvcPaused {
+		return pausedErr(name)
 	}
 	deadline := h.now().Add(h.timeout())
 	if svc == health.SvcStarting || svc == health.SvcStopping {
@@ -204,12 +272,15 @@ func (h *Handler) up(ctx context.Context, name string) api.Response {
 		// decide what to do. A stopping service ends up stopped/missing and
 		// must then be started/installed.
 		if r := h.waitService(ctx, name, "start", deadline, func(s health.ServiceState) bool {
-			return s == health.SvcRunning || s == health.SvcStopped || s == health.SvcMissing
-		}); r != nil {
+			return s != health.SvcStarting && s != health.SvcStopping
+		}, nil); r != nil {
 			return *r
 		}
-		if svc, err = h.P.ServiceState(name); err != nil {
+		if svc, _, err = h.P.ServiceState(name); err != nil {
 			return internalErr(err)
+		}
+		if svc == health.SvcPaused {
+			return pausedErr(name)
 		}
 	}
 	if svc != health.SvcRunning {
@@ -223,14 +294,18 @@ func (h *Handler) up(ctx context.Context, name string) api.Response {
 				return internalErr(err)
 			}
 			if err := h.P.InstallTunnel(path); err != nil {
-				return internalErr(err)
+				// Installed concurrently (e.g. by the WireGuard GUI)? Then
+				// just wait for it like any other start.
+				if s, _, serr := h.P.ServiceState(name); serr != nil || s == health.SvcMissing {
+					return internalErr(err)
+				}
 			}
-		case health.SvcStopped:
+		case health.SvcStopped, health.SvcFailed:
 			if err := h.P.StartService(name); err != nil {
 				return internalErr(err)
 			}
 		}
-		if r := h.waitService(ctx, name, "start", deadline, func(s health.ServiceState) bool { return s == health.SvcRunning }); r != nil {
+		if r := h.waitService(ctx, name, "start", deadline, func(s health.ServiceState) bool { return s == health.SvcRunning }, startFailed(name)); r != nil {
 			return *r
 		}
 	}
@@ -258,7 +333,7 @@ func (h *Handler) up(ctx context.Context, name string) api.Response {
 }
 
 func (h *Handler) down(ctx context.Context, name string) api.Response {
-	svc, err := h.P.ServiceState(name)
+	svc, _, err := h.P.ServiceState(name)
 	if err != nil {
 		return internalErr(err)
 	}
@@ -272,7 +347,7 @@ func (h *Handler) down(ctx context.Context, name string) api.Response {
 	if err := h.P.UninstallTunnel(name); err != nil {
 		return internalErr(err)
 	}
-	if r := h.waitService(ctx, name, "stop", deadline, func(s health.ServiceState) bool { return s == health.SvcMissing }); r != nil {
+	if r := h.waitService(ctx, name, "stop", deadline, func(s health.ServiceState) bool { return s == health.SvcMissing }, nil); r != nil {
 		return *r
 	}
 	return h.statusResp(name, true)

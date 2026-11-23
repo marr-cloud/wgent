@@ -9,6 +9,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/windows/svc"
+
+	"github.com/marr-cloud/wgent/internal/health"
 )
 
 func newTestWindows(t *testing.T, files ...string) *Windows {
@@ -131,5 +135,28 @@ func TestRunErrorNoDanglingColon(t *testing.T) {
 	err := w.UninstallTunnel("a")
 	if err == nil || strings.HasSuffix(err.Error(), ": ") {
 		t.Fatal(err)
+	}
+}
+
+func TestMapStatus(t *testing.T) {
+	cases := []struct {
+		in   svc.Status
+		want health.ServiceState
+		code uint32
+	}{
+		{svc.Status{State: svc.Stopped}, health.SvcStopped, 0},
+		{svc.Status{State: svc.Stopped, Win32ExitCode: 5}, health.SvcFailed, 5},
+		{svc.Status{State: svc.Stopped, Win32ExitCode: 1066, ServiceSpecificExitCode: 42}, health.SvcFailed, 42},
+		{svc.Status{State: svc.StartPending}, health.SvcStarting, 0},
+		{svc.Status{State: svc.ContinuePending}, health.SvcStarting, 0},
+		{svc.Status{State: svc.Running}, health.SvcRunning, 0},
+		{svc.Status{State: svc.StopPending}, health.SvcStopping, 0},
+		{svc.Status{State: svc.Paused}, health.SvcPaused, 0},
+		{svc.Status{State: svc.PausePending}, health.SvcPaused, 0},
+	}
+	for _, c := range cases {
+		if got, code := mapStatus(c.in); got != c.want || code != c.code {
+			t.Errorf("mapStatus(%+v) = %s, %d; want %s, %d", c.in, got, code, c.want, c.code)
+		}
 	}
 }
