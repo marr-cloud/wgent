@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,5 +113,83 @@ func TestServeStopsOnCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Serve did not return after cancel")
+	}
+}
+
+type panicHandler struct{}
+
+func (panicHandler) Handle(_ context.Context, req api.Request) api.Response {
+	if req.Tunnel == "boom" {
+		panic("boom")
+	}
+	return echoHandler{}.Handle(context.Background(), req)
+}
+
+func TestHandlerPanicIsRecovered(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Serve(ctx, l, panicHandler{})
+	_, err = client(l).Do(api.Request{Op: api.OpStatus, Tunnel: "boom"})
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != api.CodeInternal {
+		t.Fatalf("err = %v, want internal", err)
+	}
+	if _, err := client(l).Do(api.Request{Op: api.OpStatus, Tunnel: "home"}); err != nil {
+		t.Fatalf("server stopped serving after a panic: %v", err)
+	}
+}
+
+func TestOversizedRequestRejected(t *testing.T) {
+	srv, cli := net.Pipe()
+	go handleConn(context.Background(), srv, echoHandler{})
+	go func() {
+		cli.Write([]byte(`{"protocol_version":1,"op":"status","tunnel":"`))
+		cli.Write([]byte(strings.Repeat("a", maxRequest+1024)))
+		cli.Write([]byte(`"}`))
+	}()
+	var resp api.Response
+	if err := json.NewDecoder(cli).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == nil || resp.Error.Code != api.CodeUsage {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	cli.Close()
+}
+
+// A server that accepts but never answers (or hangs up) is "not responding",
+// which maps to exit 3 like a missing service.
+func TestClientNotResponding(t *testing.T) {
+	for _, hangUp := range []bool{false, true} {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		go func() {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			if hangUp { // read the request, then die without answering
+				json.NewDecoder(c).Decode(&api.Request{})
+				c.Close()
+				return
+			}
+			defer c.Close()
+			time.Sleep(time.Second)
+		}()
+		c := client(l)
+		c.Timeout = 100 * time.Millisecond
+		_, err = c.Do(api.Request{Op: api.OpList})
+		var apiErr *api.Error
+		if !errors.As(err, &apiErr) || apiErr.Code != api.CodeServiceNotInstalled ||
+			apiErr.Message != "wgent service not responding" || apiErr.Hint != installHint {
+			t.Errorf("hangUp=%v: err = %#v", hangUp, err)
+		}
 	}
 }

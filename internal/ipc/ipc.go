@@ -6,6 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"net"
 	"time"
 
@@ -16,6 +19,8 @@ const (
 	readTimeout    = 10 * time.Second
 	defaultTimeout = 30 * time.Second
 	installHint    = "sudo wgent service install"
+	// maxRequest bounds what the SYSTEM service reads from one connection.
+	maxRequest = 64 << 10
 )
 
 type Handler interface {
@@ -50,16 +55,28 @@ func handleConn(ctx context.Context, conn net.Conn, h Handler) {
 
 	var resp api.Response
 	var req api.Request
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(conn, maxRequest)).Decode(&req); err != nil {
 		resp = errResp(api.CodeUsage, "malformed request: "+err.Error(), "")
 	} else if req.ProtocolVersion != api.ProtocolVersion {
 		resp = errResp(api.CodeProtocolMismatch, "protocol version mismatch between wgent client and service", installHint)
 	} else {
-		resp = h.Handle(ctx, req)
+		resp = safeHandle(ctx, h, req)
 	}
 	resp.ProtocolVersion = api.ProtocolVersion
 	_ = conn.SetWriteDeadline(time.Now().Add(readTimeout))
 	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+// safeHandle runs h.Handle, turning a panic into an internal error so one bad
+// request cannot take down the SYSTEM service.
+func safeHandle(ctx context.Context, h Handler, req api.Request) (resp api.Response) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("wgent: panic handling %s %q: %v", req.Op, req.Tunnel, r)
+			resp = errResp(api.CodeInternal, fmt.Sprintf("internal error: %v", r), "")
+		}
+	}()
+	return h.Handle(ctx, req)
 }
 
 func errResp(code, msg, hint string) api.Response {
@@ -93,6 +110,10 @@ func (c Client) Do(req api.Request) (api.Response, error) {
 	}
 	var resp api.Response
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		var ne net.Error
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || (errors.As(err, &ne) && ne.Timeout()) {
+			return api.Response{}, &api.Error{Code: api.CodeServiceNotInstalled, Message: "wgent service not responding", Hint: installHint}
+		}
 		return api.Response{}, err
 	}
 	if resp.Error != nil {
